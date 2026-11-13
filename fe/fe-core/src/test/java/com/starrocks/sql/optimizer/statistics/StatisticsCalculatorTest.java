@@ -1084,4 +1084,111 @@ public class StatisticsCalculatorTest {
         calculator.estimatorStats();
         Assertions.assertEquals(Statistics.StatsSource.ANALYZE, expressionContext.getStatistics().getStatsSource());
     }
+
+    private Statistics estimateJoin(JoinOperator joinType, Group left, Group right, ColumnRefOperator leftKey,
+                                    ColumnRefOperator rightKey) {
+        var groupExpr = new GroupExpression(new LogicalJoinOperator(joinType,
+                new BinaryPredicateOperator(BinaryType.EQ, leftKey, rightKey)), Lists.newArrayList(left, right));
+        groupExpr.setGroup(new Group(2));
+        var ctx = new ExpressionContext(groupExpr);
+        new StatisticsCalculator(ctx, columnRefFactory, optimizerContext).estimatorStats();
+        return ctx.getStatistics();
+    }
+
+    private static Group joinInput(int id, double rowCount, Map<ColumnRefOperator, ColumnStatistic> columns) {
+        var group = new Group(id);
+        group.setStatistics(Statistics.builder().setOutputRowCount(rowCount).addColumnStatistics(columns).build());
+        group.setLogicalProperty(new LogicalProperty(new ColumnRefSet(Lists.newArrayList(columns.keySet()))));
+        return group;
+    }
+
+    /**
+     * An anti join outputs the preserved side's UNMATCHED rows, so its key keeps the preserved side's distinct
+     * values. It used to take the inner join's min(ndv(left), ndv(right)), collapsing a 375,705-value key to the
+     * other side's handful, and shrinking the other side made it worse.
+     */
+    @Test
+    public void testAntiJoinKeepsPreservedKeyDistinctValues() {
+        final var base = columnRefFactory.create("base_key", IntegerType.BIGINT, false);
+        final var overlay = columnRefFactory.create("overlay_key", IntegerType.BIGINT, false);
+        final var baseGroup = joinInput(0, 375705, ImmutableMap.of(base, new ColumnStatistic(1, 400000, 0, 8, 375705)));
+        double previous = 0;
+        for (double overlayRows : new double[] {1000, 100, 15, 1}) {
+            final var overlayGroup = joinInput(1, overlayRows,
+                    ImmutableMap.of(overlay, new ColumnStatistic(1, 400000, 0, 8, overlayRows)));
+            for (JoinOperator joinType : new JoinOperator[] {
+                    JoinOperator.LEFT_ANTI_JOIN, JoinOperator.NULL_AWARE_LEFT_ANTI_JOIN}) {
+                Statistics stats = estimateJoin(joinType, baseGroup, overlayGroup, base, overlay);
+                double ndv = stats.getColumnStatistic(base).getDistinctValuesCount();
+                Assertions.assertEquals(Math.min(375705, stats.getOutputRowCount()), ndv, 1, joinType + " " + overlayRows);
+                Assertions.assertTrue(stats.getOutputRowCount() <= 375705, joinType + " " + overlayRows);
+            }
+            // Fewer rows to exclude never means fewer distinct values left.
+            double ndv = estimateJoin(JoinOperator.LEFT_ANTI_JOIN, baseGroup, overlayGroup, base, overlay)
+                    .getColumnStatistic(base).getDistinctValuesCount();
+            Assertions.assertTrue(ndv >= previous, "overlay rows " + overlayRows);
+            previous = ndv;
+
+            // RIGHT_ANTI_JOIN is the mirror: the right side is preserved.
+            Statistics right = estimateJoin(JoinOperator.RIGHT_ANTI_JOIN, overlayGroup, baseGroup, overlay, base);
+            Assertions.assertEquals(Math.min(375705, right.getOutputRowCount()),
+                    right.getColumnStatistic(base).getDistinctValuesCount(), 1, "right anti " + overlayRows);
+        }
+    }
+
+    /**
+     * A preserved-side column with unknown statistics must not leave the anti join with the cross product's row
+     * count: the output is at most the preserved side's rows.
+     */
+    @Test
+    public void testAntiJoinWithUnknownColumnKeepsItsRowCount() {
+        final var base = columnRefFactory.create("base_key", IntegerType.BIGINT, false);
+        final var unknown = columnRefFactory.create("base_unknown", IntegerType.BIGINT, true);
+        final var overlay = columnRefFactory.create("overlay_key", IntegerType.BIGINT, false);
+        final var baseGroup = joinInput(0, 100000, ImmutableMap.of(
+                base, new ColumnStatistic(1, 100000, 0, 8, 100000), unknown, ColumnStatistic.unknown()));
+        final var overlayGroup = joinInput(1, 50, ImmutableMap.of(overlay, new ColumnStatistic(1, 100000, 0, 8, 50)));
+        Statistics stats = estimateJoin(JoinOperator.LEFT_ANTI_JOIN, baseGroup, overlayGroup, base, overlay);
+        Assertions.assertTrue(stats.getOutputRowCount() <= 100000, String.valueOf(stats.getOutputRowCount()));
+        Assertions.assertTrue(stats.getColumnStatistic(unknown).isUnknown());
+        Assertions.assertTrue(stats.getColumnStatistic(base).getDistinctValuesCount() > 50);
+    }
+
+    /**
+     * An outer join keeps every preserved-side row, so the preserved key keeps its own distinct values instead of
+     * the inner join's min of the two sides. The nullable side's key keeps only its matched values.
+     */
+    @Test
+    public void testOuterJoinPreservedKeyKeepsItsDistinctValues() {
+        final var lk = columnRefFactory.create("lk", IntegerType.BIGINT, false);
+        final var rk = columnRefFactory.create("rk", IntegerType.BIGINT, false);
+        final var left = joinInput(0, 6876, ImmutableMap.of(lk, new ColumnStatistic(1, 10000, 0, 8, 6876)));
+        final var right = joinInput(1, 40, ImmutableMap.of(rk, new ColumnStatistic(1, 10000, 0, 8, 33)));
+
+        Statistics leftJoin = estimateJoin(JoinOperator.LEFT_OUTER_JOIN, left, right, lk, rk);
+        Assertions.assertEquals(6876, leftJoin.getColumnStatistic(lk).getDistinctValuesCount(), 1);
+        Assertions.assertEquals(1, leftJoin.getColumnStatistic(lk).getMinValue(), 0);
+        Assertions.assertEquals(10000, leftJoin.getColumnStatistic(lk).getMaxValue(), 0);
+        Assertions.assertTrue(leftJoin.getColumnStatistic(rk).getDistinctValuesCount() <= 33);
+
+        Statistics rightJoin = estimateJoin(JoinOperator.RIGHT_OUTER_JOIN, right, left, rk, lk);
+        Assertions.assertEquals(6876, rightJoin.getColumnStatistic(lk).getDistinctValuesCount(), 1);
+        Assertions.assertTrue(rightJoin.getColumnStatistic(rk).getDistinctValuesCount() <= 33);
+
+        // Both sides are preserved in a full outer join.
+        Statistics fullJoin = estimateJoin(JoinOperator.FULL_OUTER_JOIN, left, right, lk, rk);
+        Assertions.assertEquals(6876, fullJoin.getColumnStatistic(lk).getDistinctValuesCount(), 1);
+        Assertions.assertEquals(33, fullJoin.getColumnStatistic(rk).getDistinctValuesCount(), 1);
+
+        // A preserved non-key column keeps its own distinct values, not the matched row count.
+        final var lv = columnRefFactory.create("lv", IntegerType.BIGINT, false);
+        final var leftWithValue = joinInput(0, 6876, ImmutableMap.of(
+                lk, new ColumnStatistic(1, 10000, 0, 8, 6876), lv, new ColumnStatistic(1, 5000, 0, 8, 3000)));
+        Statistics withValue = estimateJoin(JoinOperator.LEFT_OUTER_JOIN, leftWithValue, right, lk, rk);
+        Assertions.assertEquals(3000, withValue.getColumnStatistic(lv).getDistinctValuesCount(), 1);
+
+        // An inner join still narrows both keys to the values they share.
+        Statistics innerJoin = estimateJoin(JoinOperator.INNER_JOIN, left, right, lk, rk);
+        Assertions.assertTrue(innerJoin.getColumnStatistic(lk).getDistinctValuesCount() <= 33);
+    }
 }

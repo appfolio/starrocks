@@ -1405,8 +1405,7 @@ public class StatisticsCalculator extends OperatorVisitor<Void, ExpressionContex
                 break;
             case LEFT_ANTI_JOIN:
             case NULL_AWARE_LEFT_ANTI_JOIN:
-                joinStatsBuilder = Statistics.buildFrom(innerJoinStats);
-                joinStatsBuilder.setOutputRowCount(max(
+                joinStatsBuilder = buildAntiJoinStatistics(crossJoinStats, max(
                         leftRowCount * StatisticsEstimateCoefficient.DEFAULT_ANTI_JOIN_SELECTIVITY_COEFFICIENT,
                         leftRowCount - innerRowCount));
                 break;
@@ -1417,8 +1416,7 @@ public class StatisticsCalculator extends OperatorVisitor<Void, ExpressionContex
                         eqOnPredicates, joinStatsBuilder);
                 break;
             case RIGHT_ANTI_JOIN:
-                joinStatsBuilder = Statistics.buildFrom(innerJoinStats);
-                joinStatsBuilder.setOutputRowCount(max(
+                joinStatsBuilder = buildAntiJoinStatistics(crossJoinStats, max(
                         rightRowCount * StatisticsEstimateCoefficient.DEFAULT_ANTI_JOIN_SELECTIVITY_COEFFICIENT,
                         rightRowCount - innerRowCount));
                 break;
@@ -1435,6 +1433,16 @@ public class StatisticsCalculator extends OperatorVisitor<Void, ExpressionContex
                         ErrorType.INTERNAL_ERROR);
         }
         Statistics joinStats = joinStatsBuilder.build();
+        if (joinType.isOuterJoin()) {
+            ColumnRefSet preservedColumns = new ColumnRefSet();
+            if (!joinType.isRightOuterJoin()) {
+                preservedColumns.union(leftStatistics.getUsedColumns());
+            }
+            if (joinType.isRightOuterJoin() || joinType.isFullOuterJoin()) {
+                preservedColumns.union(rightStatistics.getUsedColumns());
+            }
+            joinStats = restorePreservedSideDistribution(joinStats, crossJoinStats, preservedColumns);
+        }
 
         allJoinPredicate.removeAll(eqOnPredicates);
         Statistics estimateStatistics = estimateStatistics(allJoinPredicate, joinStats);
@@ -1814,6 +1822,57 @@ public class StatisticsCalculator extends OperatorVisitor<Void, ExpressionContex
 
         context.setStatistics(builder.build());
         return visitOperator(context.getOp(), context);
+    }
+
+    // An anti join outputs the rows that found NO match, so its columns follow the preserved input's distribution.
+    // The inner join statistics describe the opposite set: they give each equi-join key min(ndv(left), ndv(right))
+    // distinct values, which for a small other side collapses the preserved key (375,705 -> 33 in the report that
+    // prompted this), and every join above then estimates a fan-out on that key. Shrinking the other side -- fewer
+    // rows to exclude -- made the estimate worse, the opposite of what an anti join does. Start from the inputs' own
+    // statistics instead (the cross product's) and only cap each column's distinct values at the output row count.
+    private static Statistics.Builder buildAntiJoinStatistics(Statistics crossJoinStats, double outputRowCount) {
+        Statistics.Builder builder = Statistics.buildFrom(crossJoinStats);
+        builder.setOutputRowCount(outputRowCount);
+        double maxDistinctValues = Math.max(1, outputRowCount);
+        crossJoinStats.getColumnStatistics().forEach((column, statistic) -> {
+            if (!statistic.isUnknown() && statistic.getDistinctValuesCount() > maxDistinctValues) {
+                builder.addColumnStatistic(column,
+                        ColumnStatistic.buildFrom(statistic).setDistinctValuesCount(maxDistinctValues).build());
+            }
+        });
+        return builder;
+    }
+
+    // An outer join keeps every row of its preserved side, matched or not, so the preserved side's columns keep that
+    // input's distribution. The join statistics are built from the inner join's, which describe only the matched rows:
+    // they narrow a preserved key to the values both sides share (min of the two distinct counts, the overlapping
+    // range) and cap every column's distinct values at the matched row count -- 40 matches out of 6,876 rows left a
+    // 3,000-value column estimated at 40. Put the preserved input's statistics back, capped at the output row count,
+    // keeping the null fraction the outer-join estimate already set. The nullable side stays as the inner join left
+    // it: only its matched values survive.
+    private static Statistics restorePreservedSideDistribution(Statistics joinStats, Statistics crossJoinStats,
+                                                               ColumnRefSet preservedColumns) {
+        double maxDistinctValues = Math.max(1, joinStats.getOutputRowCount());
+        Statistics.Builder builder = null;
+        for (Map.Entry<ColumnRefOperator, ColumnStatistic> entry : joinStats.getColumnStatistics().entrySet()) {
+            ColumnRefOperator column = entry.getKey();
+            ColumnStatistic current = entry.getValue();
+            if (!preservedColumns.contains(column) || current.isUnknown()) {
+                continue;
+            }
+            ColumnStatistic raw = crossJoinStats.getColumnStatistic(column);
+            if (raw == null || raw.isUnknown()) {
+                continue;
+            }
+            if (builder == null) {
+                builder = Statistics.buildFrom(joinStats);
+            }
+            builder.addColumnStatistic(column, ColumnStatistic.buildFrom(raw)
+                    .setDistinctValuesCount(Math.min(raw.getDistinctValuesCount(), maxDistinctValues))
+                    .setNullsFraction(current.getNullsFraction())
+                    .build());
+        }
+        return builder == null ? joinStats : builder.build();
     }
 
     public Statistics estimateInnerJoinStatistics(Statistics statistics, List<BinaryPredicateOperator> eqOnPredicates) {
