@@ -95,53 +95,58 @@ public class ConnectorTableTriggerAnalyzeMgr {
             return;
         }
 
+        // Decide which columns are due from the statistics already in hand, before touching the table.
+        // This runs for every statistics lookup the leader makes while planning, and resolving an Iceberg
+        // table outside the metadata cache reads its metadata.json from object storage (and, in this
+        // cache-only scope, does not keep the result). Most lookups find fresh statistics, so resolve the
+        // table only when an analyze will actually be queued.
         Set<String> analyzeColumns = Sets.newHashSet();
-        Triple<String, Database, Table> tableTriple = null;
-        boolean tableExist = false;
         String tableUUID = null;
+        LocalDateTime now = LocalDateTime.now();
         for (Map.Entry<ConnectorTableColumnKey, Optional<ConnectorTableColumnStats>> entry : columnStats.entrySet()) {
             ConnectorTableColumnKey columnKey = entry.getKey();
-            // first check table exist
-            if (!tableExist) {
-                try (ConnectContext.ContextScope scope = ConnectContext.enterOnlyReadIcebergCacheScope(ConnectContext.get())) {
-                    tableTriple = StatisticsUtils.getTableTripleByUUID(scope.getContext(), columnKey.tableUUID);
-                    // check table could run analyze
-                    if (!tableTriple.getRight().isAnalyzableExternalTable()) {
-                        return;
-                    }
-                    tableExist = true;
-                    tableUUID = columnKey.tableUUID;
-                } catch (Exception e) {
-                    LOG.warn("[ExternalStats] trigger skip | table_uuid={} reason=table_not_found", columnKey.tableUUID);
-                    return;
-                }
+            if (tableUUID == null) {
+                tableUUID = columnKey.tableUUID;
             }
-
-            // check column stats exist
-            Optional<ConnectorTableColumnStats> columnStatsOptional = entry.getValue();
-            if (columnStatsOptional.isEmpty()) {
+            if (isDue(entry.getValue(), now)) {
                 analyzeColumns.add(columnKey.column);
-            } else {
-                // check column stats last update time
-                ConnectorTableColumnStats columnStatsValue = columnStatsOptional.get();
-                if (columnStatsValue.getUpdateTime() == null) {
-                    analyzeColumns.add(columnKey.column);
-                }
-                LocalDateTime lastUpdateTime = DateUtils.parseStrictDateTime(columnStatsValue.getUpdateTime());
-                long rowCount = columnStatsValue.getRowCount();
-                long timeInterval = rowCount < Config.connector_table_query_trigger_analyze_small_table_rows ?
-                        Config.connector_table_query_trigger_analyze_small_table_interval :
-                        Config.connector_table_query_trigger_analyze_large_table_interval;
-                if (!lastUpdateTime.plusSeconds(timeInterval).isAfter(LocalDateTime.now())) {
-                    analyzeColumns.add(columnKey.column);
-                }
             }
         }
 
-        if (!analyzeColumns.isEmpty()) {
-            // need to execute analyze
-            this.connectorAnalyzeTaskQueue.addPendingTask(tableUUID, new ConnectorAnalyzeTask(tableTriple, analyzeColumns));
+        if (analyzeColumns.isEmpty()) {
+            return;
         }
+
+        Triple<String, Database, Table> tableTriple;
+        try (ConnectContext.ContextScope scope = ConnectContext.enterOnlyReadIcebergCacheScope(ConnectContext.get())) {
+            tableTriple = StatisticsUtils.getTableTripleByUUID(scope.getContext(), tableUUID);
+            // check table could run analyze
+            if (!tableTriple.getRight().isAnalyzableExternalTable()) {
+                return;
+            }
+        } catch (Exception e) {
+            LOG.warn("[ExternalStats] trigger skip | table_uuid={} reason=table_not_found", tableUUID);
+            return;
+        }
+
+        this.connectorAnalyzeTaskQueue.addPendingTask(tableUUID, new ConnectorAnalyzeTask(tableTriple, analyzeColumns));
+    }
+
+    private static boolean isDue(Optional<ConnectorTableColumnStats> columnStatsOptional, LocalDateTime now) {
+        if (columnStatsOptional.isEmpty()) {
+            return true;
+        }
+        ConnectorTableColumnStats columnStatsValue = columnStatsOptional.get();
+        if (columnStatsValue.getUpdateTime() == null) {
+            // No timestamp means no interval the column can be inside, so it is due. Parsing it would
+            // throw and abandon every other column of the table along with it.
+            return true;
+        }
+        LocalDateTime lastUpdateTime = DateUtils.parseStrictDateTime(columnStatsValue.getUpdateTime());
+        long timeInterval = columnStatsValue.getRowCount() < Config.connector_table_query_trigger_analyze_small_table_rows ?
+                Config.connector_table_query_trigger_analyze_small_table_interval :
+                Config.connector_table_query_trigger_analyze_large_table_interval;
+        return !lastUpdateTime.plusSeconds(timeInterval).isAfter(now);
     }
 
     public void addDictUpdateTask(ConnectorTableColumnKey key, Optional<String> fileName) {
