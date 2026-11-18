@@ -15,6 +15,7 @@
 
 package com.starrocks.connector.iceberg.glue;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Strings;
 import com.google.common.collect.Maps;
 import com.starrocks.catalog.Database;
@@ -35,22 +36,30 @@ import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.aws.AwsClientFactories;
 import org.apache.iceberg.aws.AwsProperties;
 import org.apache.iceberg.aws.glue.GlueCatalog;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import software.amazon.awssdk.services.glue.GlueClient;
+import software.amazon.awssdk.services.glue.model.EntityNotFoundException;
+import software.amazon.awssdk.services.glue.model.GetTableRequest;
 
 import java.net.URI;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 import static com.starrocks.connector.ConnectorTableId.CONNECTOR_ID_GENERATOR;
 import static com.starrocks.connector.iceberg.IcebergMetadata.LOCATION_PROPERTY;
+import static org.apache.iceberg.BaseMetastoreTableOperations.ICEBERG_TABLE_TYPE_VALUE;
+import static org.apache.iceberg.BaseMetastoreTableOperations.METADATA_LOCATION_PROP;
+import static org.apache.iceberg.BaseMetastoreTableOperations.TABLE_TYPE_PROP;
 
 public class IcebergGlueCatalog implements IcebergCatalog {
     private static final Logger LOG = LogManager.getLogger(IcebergGlueCatalog.class);
@@ -58,7 +67,19 @@ public class IcebergGlueCatalog implements IcebergCatalog {
     private final Configuration conf;
     private final GlueCatalog delegate;
 
+    // A Glue client of our own for tableExists: GlueCatalog does not expose its client. Built on first
+    // use, from the same client factory and properties as the delegate's.
+    private final Supplier<GlueClient> glueClientFactory;
+    private final String glueCatalogId;
+    private volatile GlueClient glueClient;
+
     public IcebergGlueCatalog(String name, Configuration conf, Map<String, String> properties) {
+        this(name, conf, properties, null);
+    }
+
+    @VisibleForTesting
+    IcebergGlueCatalog(String name, Configuration conf, Map<String, String> properties,
+                       Supplier<GlueClient> glueClientFactory) {
         this.conf = conf;
         Map<String, String> copiedProperties = Maps.newHashMap(properties);
 
@@ -67,6 +88,10 @@ public class IcebergGlueCatalog implements IcebergCatalog {
         copiedProperties.put(AwsProperties.CLIENT_FACTORY, IcebergAwsClientFactory.class.getName());
         copiedProperties.put(AwsProperties.GLUE_CATALOG_SKIP_NAME_VALIDATION, "true");
         delegate = (GlueCatalog) CatalogUtil.loadCatalog(GlueCatalog.class.getName(), name, copiedProperties, conf);
+
+        this.glueClientFactory = glueClientFactory != null ? glueClientFactory :
+                () -> AwsClientFactories.from(copiedProperties).glue();
+        this.glueCatalogId = new AwsProperties(copiedProperties).glueCatalogId();
     }
 
     @Override
@@ -79,9 +104,57 @@ public class IcebergGlueCatalog implements IcebergCatalog {
         return delegate.loadTable(TableIdentifier.of(dbName, tableName));
     }
 
+    /**
+     * GlueCatalog inherits Catalog.tableExists, which loads the table and so reads and parses its
+     * metadata.json. Glue alone gives the same answer: loading succeeds only if the Glue table exists,
+     * is marked as an Iceberg table and points at a metadata file. AnalyzeMgr's dropped-table cleanup
+     * calls this for every external table with statistics on each pass, so loading made that cleanup
+     * re-read every table's metadata. As before, errors other than a missing table propagate.
+     */
     @Override
     public boolean tableExists(ConnectContext context, String dbName, String tableName) throws StarRocksConnectorException {
-        return delegate.tableExists(TableIdentifier.of(dbName, tableName));
+        software.amazon.awssdk.services.glue.model.Table glueTable;
+        try {
+            glueTable = getGlueClient().getTable(GetTableRequest.builder()
+                    .catalogId(glueCatalogId)
+                    .databaseName(dbName)
+                    .name(tableName)
+                    .build()).table();
+        } catch (EntityNotFoundException e) {
+            return false;
+        }
+        if (glueTable == null || !glueTable.hasParameters()) {
+            return false;
+        }
+        Map<String, String> parameters = glueTable.parameters();
+        return ICEBERG_TABLE_TYPE_VALUE.equalsIgnoreCase(parameters.get(TABLE_TYPE_PROP))
+                && !Strings.isNullOrEmpty(parameters.get(METADATA_LOCATION_PROP));
+    }
+
+    private GlueClient getGlueClient() {
+        GlueClient client = glueClient;
+        if (client == null) {
+            synchronized (this) {
+                client = glueClient;
+                if (client == null) {
+                    client = glueClientFactory.get();
+                    glueClient = client;
+                }
+            }
+        }
+        return client;
+    }
+
+    @Override
+    public void shutdown() {
+        GlueClient client;
+        synchronized (this) {
+            client = glueClient;
+            glueClient = null;
+        }
+        if (client != null) {
+            client.close();
+        }
     }
 
     @Override
