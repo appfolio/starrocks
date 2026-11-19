@@ -2422,8 +2422,8 @@ queryNoWith
     ;
 
 queryPeriod
-    : FOR? periodType BETWEEN expression AND expression
-    | FOR? periodType FROM expression TO expression
+    : FOR? periodType BETWEEN start=expression AND end=expression
+    | FOR? periodType FROM start=expression TO end=expression
     | FOR? periodType ALL
     | FOR? periodType AS OF end=expression
     ;

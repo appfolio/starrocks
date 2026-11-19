@@ -28,6 +28,10 @@ public class QueryPeriod implements ParseNode {
         this(periodType, Optional.empty(), Optional.of(end));
     }
 
+    public static QueryPeriod range(PeriodType periodType, Expr start, Expr end) {
+        return new QueryPeriod(periodType, Optional.of(start), Optional.of(end));
+    }
+
     private QueryPeriod(PeriodType periodType, Optional<Expr> start, Optional<Expr> end) {
         this.periodType = periodType;
         this.start = start;

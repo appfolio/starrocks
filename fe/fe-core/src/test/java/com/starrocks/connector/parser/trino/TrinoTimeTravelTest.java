@@ -163,10 +163,18 @@ public class TrinoTimeTravelTest {
                 "select * from time_travel_test version as of 4392135601283712525", QueryPeriod.PeriodType.VERSION);
         Assertions.assertEquals(4392135601283712525L, ((IntLiteral) noForKeyword.getEnd().orElseThrow()).getValue());
 
-        // BETWEEN/FROM..TO/ALL parse but build no QueryPeriod - the StarRocks parser keeps only the raw
-        // text for MySQL external tables. Asserted so the trino path stays identical to the native one.
-        TableRelation between = parseTableRelation("select * from time_travel_test for version between 1 and 2");
-        Assertions.assertNull(between.getQueryPeriod());
-        Assertions.assertFalse(between.getQueryPeriodString().isEmpty());
+        for (String range : List.of("for version between 1 and 2", "for version from 1 to 2")) {
+            QueryPeriod versionRange = parseTableRelation("select * from time_travel_test " + range).getQueryPeriod();
+            Assertions.assertEquals(QueryPeriod.PeriodType.VERSION, versionRange.getPeriodType(), range);
+            Assertions.assertEquals(1L, ((IntLiteral) versionRange.getStart().orElseThrow()).getValue());
+            Assertions.assertEquals(2L, ((IntLiteral) versionRange.getEnd().orElseThrow()).getValue());
+        }
+
+        // A timestamp range and ALL still build no QueryPeriod; the raw text is kept for MySQL external tables.
+        for (String range : List.of("for system_time between '2024-01-01' and '2024-01-02'", "for version all")) {
+            TableRelation relation = parseTableRelation("select * from time_travel_test " + range);
+            Assertions.assertNull(relation.getQueryPeriod());
+            Assertions.assertFalse(relation.getQueryPeriodString().isEmpty());
+        }
     }
 }

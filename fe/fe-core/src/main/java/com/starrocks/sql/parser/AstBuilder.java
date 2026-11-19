@@ -6554,6 +6554,13 @@ public class AstBuilder extends com.starrocks.sql.parser.StarRocksBaseVisitor<Pa
 
         QueryPeriod.PeriodType type = getPeriodType((Token) context.periodType().getChild(0).getPayload());
         Expr end = (Expr) visit(context.end);
+        if (context.start != null) {
+            // Start is exclusive, end inclusive: Iceberg reads the appends after start up to end.
+            if (type != QueryPeriod.PeriodType.VERSION) {
+                return null;
+            }
+            return QueryPeriod.range(type, (Expr) visit(context.start), end);
+        }
         return new QueryPeriod(type, end);
     }
 
