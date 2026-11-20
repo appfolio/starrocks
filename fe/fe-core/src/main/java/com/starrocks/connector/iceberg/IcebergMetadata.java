@@ -2584,7 +2584,11 @@ public class IcebergMetadata implements ConnectorMetadata {
 
         final boolean isOverwrite;
         final boolean isRewrite;
-        if (!commitInfos.isEmpty()) {
+        if (extra instanceof IcebergSinkExtra && ((IcebergSinkExtra) extra).isRewrite()) {
+            // A rewrite whose selected files hold no live rows commits removals only, with no commit infos.
+            isOverwrite = false;
+            isRewrite = true;
+        } else if (!commitInfos.isEmpty()) {
             TSinkCommitInfo sinkCommitInfo = commitInfos.get(0);
             if (sinkCommitInfo.isSetIs_overwrite()) {
                 isOverwrite = sinkCommitInfo.is_overwrite;
@@ -3034,6 +3038,7 @@ public class IcebergMetadata implements ConnectorMetadata {
         // so conflict detection covers the window between scan and commit, not a fresher
         // snapshot re-read at commit time.
         private Long baseSnapshotId;
+        private boolean rewrite = false;
 
         public IcebergSinkExtra() {
             this.scannedDataFiles = new HashSet<>();
@@ -3070,6 +3075,14 @@ public class IcebergMetadata implements ConnectorMetadata {
 
         public Long getBaseSnapshotId() {
             return baseSnapshotId;
+        }
+
+        public void setRewrite(boolean rewrite) {
+            this.rewrite = rewrite;
+        }
+
+        public boolean isRewrite() {
+            return rewrite;
         }
     }
 

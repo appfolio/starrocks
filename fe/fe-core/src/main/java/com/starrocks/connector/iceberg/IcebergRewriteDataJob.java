@@ -36,11 +36,13 @@ import com.starrocks.sql.ast.TableRef;
 import com.starrocks.sql.plan.ExecPlan;
 import com.starrocks.thrift.TSinkCommitInfo;
 import com.starrocks.thrift.TUniqueId;
+import org.apache.iceberg.DataFile;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -69,6 +71,7 @@ public class IcebergRewriteDataJob {
     // the comment on IcebergSinkExtra.baseSnapshotId.
     private Long baseSnapshotId;
     private long batchParallelism = 1;
+    private boolean skipSingleFilePartitions = false;
     private StatementBase parsedStmt;
     private final ConcurrentLinkedQueue<FinishArgs> collected = new ConcurrentLinkedQueue<>();
 
@@ -168,6 +171,10 @@ public class IcebergRewriteDataJob {
         this.originAlterStmt = stmt;
     }
 
+    public void setSkipSingleFilePartitions(boolean skipSingleFilePartitions) {
+        this.skipSingleFilePartitions = skipSingleFilePartitions;
+    }
+
     public void prepare() throws Exception {
         this.parsedStmt = com.starrocks.sql.parser.SqlParser
                 .parse(executionSql, context.getSessionVariable())
@@ -203,6 +210,10 @@ public class IcebergRewriteDataJob {
         this.rewriteData = new IcebergRewriteData();
         scanNodes.forEach(node -> rewriteData.addSource(node.getSourceRange()));
         this.rewriteData.setBatchSize(batchSize);
+        if (skipSingleFilePartitions) {
+            int currentSpecId = scanNodes.get(0).getIcebergTable().getNativeTable().spec().specId();
+            this.rewriteData.setSkipSingleFilePartitions(true, currentSpecId);
+        }
         this.rewriteData.buildNewScanNodeRange(minFileSizeBytes, rewriteAll);
     }
 
@@ -306,21 +317,38 @@ public class IcebergRewriteDataJob {
                 }
             }
 
-            if (collected.size() == 0) {
+            // A task group whose files hold no live rows writes nothing and never reaches the finish handler,
+            // so the files to remove come from the job's own selection, not from the batches that wrote rows.
+            Set<DataFile> pickedDataFiles = rewriteData.getPickedDataFiles();
+            if (collected.isEmpty() && pickedDataFiles.isEmpty()) {
                 return RewriteMetrics.EMPTY;
             }
             IcebergSinkExtra extra = new IcebergSinkExtra();
             extra.setBaseSnapshotId(baseSnapshotId);
+            extra.setRewrite(true);
             List<TSinkCommitInfo> faList = Lists.newArrayList();
             for (FinishArgs fa : collected) {
-                extra.addScannedDataFiles(((IcebergSinkExtra) fa.getExtra()).getScannedDataFiles());
-                extra.addAppliedDeleteFiles(((IcebergSinkExtra) fa.getExtra()).getAppliedDeleteFiles());
+                IcebergSinkExtra batchExtra = (IcebergSinkExtra) fa.getExtra();
+                if (!pickedDataFiles.containsAll(batchExtra.getScannedDataFiles())) {
+                    throw new StarRocksConnectorException("rewrite batch scanned a data file outside the selection");
+                }
+                extra.addAppliedDeleteFiles(batchExtra.getAppliedDeleteFiles());
                 faList.addAll(fa.getCommitInfos());
             }
+            extra.addScannedDataFiles(pickedDataFiles);
+            if (!hasPartitionFilter) {
+                extra.addAppliedDeleteFiles(rewriteData.getDanglingPosDeleteFiles());
+                if (rewriteAll) {
+                    extra.addAppliedDeleteFiles(rewriteData.getPickedEqDeleteFiles());
+                }
+            }
+            FinishArgs first = collected.peek();
             try {
                 context.getGlobalStateMgr().getMetadataMgr().finishSink(
-                        collected.peek().getCatalog(), collected.peek().getDb(), collected.peek().getTable(),
-                        faList, collected.peek().getBranch(), extra, context);
+                        first != null ? first.getCatalog() : originAlterStmt.getCatalogName(),
+                        first != null ? first.getDb() : originAlterStmt.getDbName(),
+                        first != null ? first.getTable() : originAlterStmt.getTableName(),
+                        faList, first != null ? first.getBranch() : null, extra, context);
                 return buildMetrics(faList, extra);
             } catch (Exception e) {
                 LOG.error("Failed to commit iceberg rewrite on [{}]", originAlterStmt.getTableName(), e);

@@ -151,6 +151,7 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.BaseTable;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DataFiles;
+import org.apache.iceberg.DataOperations;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileContent;
 import org.apache.iceberg.FileFormat;
@@ -3678,6 +3679,42 @@ public class IcebergMetadataTest extends TableTestBase {
         Assertions.assertNotNull(newSnapshot, "rewrite commit must produce a snapshot");
         Assertions.assertNotEquals(snapshotBeforeRewrite, newSnapshot.snapshotId(),
                 "rewrite commit must advance the snapshot id past the pre-rewrite state");
+    }
+
+    @Test
+    public void testCommitRewriteRemovesFilesWithNoLiveRows() throws Exception {
+        // Every row of FILE_A is deleted, so the rewrite writes nothing and there are no commit infos.
+        mockedNativeTableA.newFastAppend().appendFile(FILE_A).commit();
+        mockedNativeTableA.newRowDelta().addDeletes(FILE_A_DELETES).commit();
+        long planTimeSnapshotId = mockedNativeTableA.currentSnapshot().snapshotId();
+
+        IcebergHiveCatalog icebergHiveCatalog = new IcebergHiveCatalog(CATALOG_NAME, new Configuration(), DEFAULT_CONFIG);
+        IcebergMetadata metadata = new IcebergMetadata(CATALOG_NAME, HDFS_ENVIRONMENT, icebergHiveCatalog,
+                Executors.newSingleThreadExecutor(), DEFAULT_CATALOG_PROPERTIES);
+        IcebergTable icebergTable = new IcebergTable(1, "srTableName", CATALOG_NAME, "resource_name", "iceberg_db",
+                "iceberg_table", "", Lists.newArrayList(), mockedNativeTableA, Maps.newHashMap());
+
+        new Expectations(metadata) {
+            {
+                metadata.getTable((ConnectContext) any, anyString, anyString);
+                result = icebergTable;
+                minTimes = 0;
+            }
+        };
+
+        IcebergMetadata.IcebergSinkExtra extra = new IcebergMetadata.IcebergSinkExtra();
+        extra.setRewrite(true);
+        extra.addScannedDataFiles(Sets.newHashSet(FILE_A));
+        extra.addAppliedDeleteFiles(Sets.newHashSet(FILE_A_DELETES));
+        extra.setBaseSnapshotId(planTimeSnapshotId);
+
+        metadata.finishSink("iceberg_db", "iceberg_table", Lists.newArrayList(), null, extra);
+
+        mockedNativeTableA.refresh();
+        Snapshot snapshot = mockedNativeTableA.currentSnapshot();
+        Assertions.assertEquals(DataOperations.REPLACE, snapshot.operation());
+        Assertions.assertEquals("0", snapshot.summary().get("total-data-files"));
+        Assertions.assertEquals("0", snapshot.summary().get("total-delete-files"));
     }
 
     @Test

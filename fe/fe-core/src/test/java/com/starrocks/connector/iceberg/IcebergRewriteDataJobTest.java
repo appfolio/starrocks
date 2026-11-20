@@ -15,6 +15,7 @@
 package com.starrocks.connector.iceberg;
 
 import com.google.common.collect.Lists;
+import com.google.common.collect.Sets;
 import com.starrocks.common.jmockit.Deencapsulation;
 import com.starrocks.connector.RemoteFileInfo;
 import com.starrocks.connector.iceberg.IcebergMetadata.IcebergSinkExtra;
@@ -46,6 +47,7 @@ import mockit.Mock;
 import mockit.MockUp;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 
 import java.util.ArrayList;
@@ -265,6 +267,49 @@ public class IcebergRewriteDataJobTest {
         Assertions.assertTrue(plannedStmt[0] instanceof IcebergRewriteStmt);
 
         verify(state, never()).setError(anyString());
+    }
+
+    @Test
+    public void execute_commitsPickedFilesWhenNoBatchWroteRows() throws Exception {
+        ConnectContext ctx = mock(ConnectContext.class, Mockito.RETURNS_DEEP_STUBS);
+        QueryState state = mock(QueryState.class);
+        when(ctx.getState()).thenReturn(state);
+
+        AlterTableStmt alter = mock(AlterTableStmt.class);
+        when(alter.getTableName()).thenReturn("t");
+        when(alter.getCatalogName()).thenReturn("c");
+        when(alter.getDbName()).thenReturn("db");
+
+        GlobalStateMgr gsm = mock(GlobalStateMgr.class);
+        MetadataMgr metadata = mock(MetadataMgr.class);
+        when(ctx.getGlobalStateMgr()).thenReturn(gsm);
+        when(gsm.getMetadataMgr()).thenReturn(metadata);
+
+        IcebergRewriteDataJob job = new IcebergRewriteDataJob(
+                "insert into t select 1", "insert into t select 1", false, false, 0L, 10L, 1L, false, ctx, alter);
+        IcebergScanNode scanNode = mock(IcebergScanNode.class);
+        Deencapsulation.setField(job, "execPlan", mockPlanWithOneIcebergScan(scanNode));
+        Deencapsulation.setField(job, "scanNodes", Collections.singletonList(scanNode));
+        Deencapsulation.setField(job, "rewriteStmt", mock(IcebergRewriteStmt.class));
+
+        // Every picked file holds no live rows: the batch writes nothing and never reaches the finish handler.
+        IcebergRewriteData rewriteData = mock(IcebergRewriteData.class);
+        when(rewriteData.hasMoreTaskGroup()).thenReturn(false);
+        when(rewriteData.getPickedDataFiles()).thenReturn(Sets.newHashSet(TableTestBase.FILE_A));
+        when(rewriteData.getDanglingPosDeleteFiles()).thenReturn(Sets.newHashSet(TableTestBase.FILE_A_DELETES));
+        Deencapsulation.setField(job, "rewriteData", rewriteData);
+
+        IcebergRewriteDataJob.RewriteMetrics metrics = job.execute();
+
+        ArgumentCaptor<Object> extraCaptor = ArgumentCaptor.forClass(Object.class);
+        verify(metadata).finishSink(eq("c"), eq("db"), eq("t"), eq(Collections.emptyList()), eq(null),
+                extraCaptor.capture(), eq(ctx));
+        IcebergSinkExtra extra = (IcebergSinkExtra) extraCaptor.getValue();
+        Assertions.assertTrue(extra.isRewrite());
+        Assertions.assertEquals(Sets.newHashSet(TableTestBase.FILE_A), extra.getScannedDataFiles());
+        Assertions.assertEquals(Sets.newHashSet(TableTestBase.FILE_A_DELETES), extra.getAppliedDeleteFiles());
+        assertEquals(1, metrics.getRewrittenDataFilesCount());
+        assertEquals(1, metrics.getRewrittenDeleteFilesCount());
     }
 
     @Test

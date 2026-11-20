@@ -240,25 +240,8 @@ public class IcebergConnectorScanRangeSource extends ConnectorScanRangeSource {
                 RemoteFileInfo remoteFileInfo = remoteFileInfoSource.getOutput();
                 IcebergRemoteFileInfo icebergRemoteFileInfo = remoteFileInfo.cast();
                 FileScanTask fileScanTask = icebergRemoteFileInfo.getFileScanTask();
-                if (allFiles || fileScanTask.file().fileSizeInBytes() <= fileSizeThreshold) {
+                if (IcebergRewriteFileSelector.isRewriteCandidate(fileScanTask, fileSizeThreshold, allFiles)) {
                     res.add(fileScanTask);
-                } else {
-                    for (DeleteFile del : fileScanTask.deletes()) {
-                        if (del.content() == FileContent.POSITION_DELETES) {
-                            // if the pos delete is a file level pos delete, then we may skip the data file scan if 
-                            // the condition does not match. Otherwise(partition-level delete file), 
-                            // we scan the data file anyway, to make sure the pos delete can be eliminated any way
-                            int filePathId = 2147483546; //https://iceberg.apache.org/spec/#reserved-field-ids
-                            if (del.referencedDataFile() == null && (del.lowerBounds() != null && del.upperBounds() != null &&
-                                    !del.lowerBounds().get(filePathId).equals(del.upperBounds().get(filePathId)))) {
-                                //partition pos delete file related files
-                                res.add(fileScanTask);
-                            }
-                        } else if (del.content() == FileContent.EQUALITY_DELETES) {
-                            // to judge if a equality delete is fully applied is not easy. Only the rewrite-all can make sure that
-                            // we can eliminate the equality delete files.
-                        }
-                    }
                 }
             }
             return res;

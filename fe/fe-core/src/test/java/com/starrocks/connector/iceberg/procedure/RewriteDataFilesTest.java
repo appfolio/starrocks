@@ -396,4 +396,39 @@ public class RewriteDataFilesTest {
         Assertions.assertFalse(capturedSql[0].contains("_row_id"),
                 "SQL should NOT include _row_id for v2 table: " + capturedSql[0]);
     }
+    @Test
+    void rewriteDataFilesPassesSkipSingleFilePartitions(@Mocked IcebergHiveCatalog icebergHiveCatalog) throws Exception {
+        TableOperations ops = Mockito.mock(TableOperations.class);
+        TableMetadata metadata = Mockito.mock(TableMetadata.class);
+        Mockito.when(metadata.formatVersion()).thenReturn(2);
+        Mockito.when(ops.current()).thenReturn(metadata);
+        BaseTable baseTable = Mockito.mock(BaseTable.class);
+        Mockito.when(baseTable.operations()).thenReturn(ops);
+
+        AlterTableStmt stmt = Mockito.mock(AlterTableStmt.class);
+        Mockito.when(stmt.getCatalogName()).thenReturn("c1");
+        Mockito.when(stmt.getDbName()).thenReturn("db");
+        Mockito.when(stmt.getTableName()).thenReturn("table");
+
+        AlterTableOperationClause clause = Mockito.mock(AlterTableOperationClause.class);
+        Mockito.when(clause.getWhere()).thenReturn(null);
+
+        ConnectContext ctx = Mockito.mock(ConnectContext.class);
+        Mockito.when(ctx.getState()).thenReturn(new QueryState());
+        Mockito.when(ctx.getSessionVariable()).thenReturn(new SessionVariable());
+
+        try (MockedConstruction<IcebergRewriteDataJob> mocked = Mockito.mockConstruction(IcebergRewriteDataJob.class,
+                (mock, context) -> {
+                    Mockito.doNothing().when(mock).prepare();
+                    Mockito.when(mock.execute()).thenReturn(IcebergRewriteDataJob.RewriteMetrics.EMPTY);
+                })) {
+            IcebergTableProcedureContext procedureContext =
+                    new IcebergTableProcedureContext(icebergHiveCatalog, baseTable, ctx, null,
+                            HDFS_ENVIRONMENT, stmt, clause);
+            RewriteDataFilesProcedure.getInstance().execute(procedureContext,
+                    Map.of("skip_single_file_partitions", ConstantOperator.createBoolean(true)));
+
+            Mockito.verify(mocked.constructed().get(0)).setSkipSingleFilePartitions(true);
+        }
+    }
 }
